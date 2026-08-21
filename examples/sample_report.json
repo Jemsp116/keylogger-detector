@@ -1,0 +1,32 @@
+[
+  {
+    "pid": 6840,
+    "name": "winkeylog.exe",
+    "exe": "C:\\Users\\me\\AppData\\Local\\Temp\\winkeylog.exe",
+    "user": "DESKTOP\\me",
+    "started": "2026-08-21T09:14:02",
+    "score": 13,
+    "risk": "HIGH",
+    "reasons": [
+      "[+4] Process name matches keylogger pattern 'key\\s*log'",
+      "[+3] Executable runs from a volatile/temp directory (C:\\Users\\me\\AppData\\Local\\Temp\\winkeylog.exe)",
+      "[+3] Open handle to a log-like file in a volatile/temp location (C:\\Users\\me\\AppData\\Local\\Temp\\keys.log)",
+      "[+1] Runs without a visible window (headless/background)",
+      "[+2] Headless process with an established outbound connection (203.0.113.9:443)"
+    ]
+  },
+  {
+    "pid": 10016,
+    "name": "CodeSetup-stable-110a328ea5.exe",
+    "exe": "C:\\Users\\me\\AppData\\Local\\Temp\\vscode-stable-user-x64\\CodeSetup-stable-110a328ea5.exe",
+    "user": "DESKTOP\\me",
+    "started": "2026-08-21T11:02:11",
+    "score": 5,
+    "risk": "LOW",
+    "reasons": [
+      "[+3] Executable runs from a volatile/temp directory (C:\\Users\\me\\AppData\\Local\\Temp\\vscode-stable-user-x64\\CodeSetup-stable-110a328ea5.exe)",
+      "[+1] Runs without a visible window (headless/background)",
+      "[+1] Lightweight background footprint (1 threads, 0.9MB)"
+    ]
+  }
+]

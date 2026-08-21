@@ -1,0 +1,19 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Scan reports (the committed example under examples/ is kept intentionally)
+/report.json
+*.report.json
+
+# Environments / editors
+venv/
+.venv/
+.env
+.idea/
+.vscode/
+
+# Local tool settings
+.claude/settings.local.json
