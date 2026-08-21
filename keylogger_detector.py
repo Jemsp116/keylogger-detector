@@ -167,17 +167,56 @@ def is_elevated():
     return None
 
 
-def owns_console():
-    """True if this process is the only one attached to its console window.
+def _own_console_pids():
+    """PIDs on our console that are really *us* rather than a separate program.
 
-    That is the signature of a double-clicked .exe (and of an elevated one,
-    which Windows always gives a brand-new console): when the program returns,
-    the console is destroyed with it, so any output vanishes before it can be
-    read. Launched from an existing cmd/PowerShell/bash session, the shell is
-    attached too and the window survives.
+    A PyInstaller --onefile binary runs as two processes: the bootloader that
+    unpacks the archive and the child that runs the actual code. Both attach to
+    the same console. A double-clicked .py can likewise be py.exe launching
+    python.exe. Those halves must not be mistaken for "a shell is watching us".
+    """
+    us = {os.getpid()}
+    try:
+        me = psutil.Process()
+        try:
+            own_exe = os.path.normcase(me.exe())
+        except (psutil.Error, OSError):
+            own_exe = None
+        launchers = {"python.exe", "pythonw.exe", "py.exe", "python", "python3"}
+        for ancestor in me.parents():
+            try:
+                name = (ancestor.name() or "").lower()
+                exe = ancestor.exe()
+            except (psutil.Error, OSError):
+                continue
+            same_binary = bool(own_exe) and os.path.normcase(exe or "") == own_exe
+            # Unfrozen, the interpreter (or the py launcher that started it) is
+            # part of our own invocation, not an independent shell.
+            interpreter = (not IS_FROZEN) and name in launchers
+            if same_binary or interpreter:
+                us.add(ancestor.pid)
+            else:
+                # Anything else above us is a real parent program (cmd, bash,
+                # explorer): stop, its console outlives us.
+                break
+    except (psutil.Error, OSError):
+        pass
+    return us
+
+
+def owns_console():
+    """True if this console window is destroyed the moment we exit.
+
+    That is the double-clicked / UAC-elevated case: Windows hands the program a
+    brand-new console and tears it down with the process, so the report flashes
+    past unread -- which is exactly what "the terminal closes" looks like.
+
+    Measured, not assumed: GetConsoleProcessList on a --onefile build returns
+    the bootloader *and* the child, so an equality test against 1 never fires.
+    We therefore subtract our own halves and ask whether anybody else is left.
 
     Returns False on non-Windows and whenever the answer cannot be determined,
-    so we never block a scripted run waiting for a keypress.
+    so a scripted run is never left blocking on a keypress.
     """
     if not IS_WINDOWS:
         return False
@@ -189,9 +228,17 @@ def owns_console():
         kernel32.GetConsoleProcessList.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
         kernel32.GetConsoleProcessList.restype = wintypes.DWORD
 
-        buf = (wintypes.DWORD * 8)()
-        count = kernel32.GetConsoleProcessList(buf, 8)
-        return count == 1
+        # Ask for the real count first: the buffer must be large enough or the
+        # call reports the required size instead of filling it in.
+        size = kernel32.GetConsoleProcessList((wintypes.DWORD * 1)(), 1)
+        if size == 0:
+            return False
+        buf = (wintypes.DWORD * max(size, 2))()
+        count = kernel32.GetConsoleProcessList(buf, len(buf))
+        if count == 0:
+            return False
+        console_pids = {buf[i] for i in range(min(count, len(buf)))}
+        return not (console_pids - _own_console_pids())
     except Exception:
         return False
 
@@ -527,15 +574,16 @@ def _score_process(proc, have_window_map, visible_pids, deep):
         return None
 
 
-def scan(min_score=4, deep=False, stats=None):
+def scan(min_score=4, deep=False, stats=None, progress=None):
     """Score every visible process and return those at or above `min_score`.
 
     If `stats` is a dict it is filled in with what the scan actually did --
-    process counts, how many were only partially readable, elapsed time, and
-    the highest-scoring processes that stayed *below* the threshold. main()
-    prints those so that a clean run still shows evidence of work instead of
-    a bare "nothing found". Passing stats is optional, which keeps the older
-    two-argument call signature working.
+    process counts, how many were only partially readable, elapsed time, every
+    scored process, and the highest-scoring ones that stayed *below* the
+    threshold. main() prints those so that a clean run still shows evidence of
+    work instead of a bare "nothing found". `progress`, if given, is called with
+    the running process count so a slow --deep scan can show it is alive. Both
+    are optional, which keeps the older two-argument call signature working.
     """
     started = time.perf_counter()
 
@@ -563,6 +611,8 @@ def scan(min_score=4, deep=False, stats=None):
         if is_self(info, own_pid, own_exe):
             continue
         total += 1
+        if progress is not None and total % 20 == 0:
+            progress(total)
         r = _score_process(proc, have_window_map, visible_pids, deep)
         if r is None:
             # Exited between enumeration and inspection, or wholly unreadable.
@@ -588,6 +638,7 @@ def scan(min_score=4, deep=False, stats=None):
             "elapsed": time.perf_counter() - started,
             "window_map": have_window_map,
             "near_misses": [r for r in scored if r["score"] < min_score],
+            "all": scored,
         })
 
     return results
@@ -715,12 +766,13 @@ def print_near_misses(stats, min_score, top):
               f"(--top {len(candidates)} to list them all)")
 
 
-def print_verdict(results, stats, min_score, top):
+def print_verdict(results, stats, min_score, top, show_context=True):
     """Print the headline conclusion, then either findings or near-miss context."""
     if not results:
         print(f"RESULT: CLEAN - no process reached a score of {min_score}.")
         print("        Nothing on this system looks like a keylogger by these heuristics.\n")
-        print_near_misses(stats, min_score, top)
+        if show_context:
+            print_near_misses(stats, min_score, top)
         print("\n  Reminder: these are behavioural heuristics, not proof of absence."
               "\n  A kernel-mode or in-memory-only logger can evade every check here.")
         return
@@ -736,16 +788,78 @@ def print_verdict(results, stats, min_score, top):
     print_report(results)
 
 
-def pause_if_double_clicked(no_pause):
-    """Hold the window open when we are the only process on the console.
+def print_process_table(stats, min_score):
+    """List every process the scan inspected, highest score first.
 
-    A double-clicked (or UAC-elevated) .exe gets a console of its own that
-    Windows destroys the instant the program returns -- the report would flash
-    past unread, which looks exactly like "the terminal is always empty".
-    Launched from an existing shell, owns_console() is False and we return
-    immediately so piping and scripting are unaffected.
+    The scoring report answers "is anything wrong"; this answers "what did you
+    actually look at", which is the question a first-time user asks when a
+    clean scan prints no process names at all. Rows at or above the threshold
+    are marked so the flagged ones stay findable in a 300-row list.
     """
-    if no_pause or not IS_FROZEN or not owns_console():
+    rows = stats.get("all", [])
+    if not rows:
+        print("  No processes could be inspected at all - this is not a normal result.\n")
+        return
+
+    print(f"  All {len(rows)} inspected processes, highest score first "
+          f"('>>' = at or above the threshold of {min_score}):\n")
+    print(f"    {'':<3}{'SCORE':<7}{'PID':<8}{'PROCESS':<26}{'USER':<22}SIGNALS")
+    print("    " + "-" * 96)
+    for r in rows:
+        mark = ">>" if r["score"] >= min_score else ""
+        name = (r["name"] or "?")[:25]
+        user = (r["user"] or "-")[:21]
+        signals = _short_reasons(r["reasons"]) if r["score"] else "-"
+        print(f"    {mark:<3}{r['score']:<7}{r['pid']:<8}{name:<26}{user:<22}{signals}")
+    print()
+
+
+def _progress_writer():
+    """Return a live scanned-process counter, or None when output isn't a console.
+
+    The counter rewrites one line with a carriage return, so it must never run
+    into a redirected file or a pipe -- control characters in a saved log are
+    worse than no progress at all.
+    """
+    try:
+        if not sys.stdout.isatty():
+            return None
+    except (AttributeError, ValueError):
+        return None
+
+    def write(count):
+        sys.stdout.write(f"\r  inspected {count} processes ...")
+        sys.stdout.flush()
+
+    return write
+
+
+def _clear_progress(progress):
+    """Erase the counter line so the report starts on a clean row."""
+    if progress is None:
+        return
+    try:
+        sys.stdout.write("\r" + " " * 40 + "\r")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def pause_before_exit(force=False, never=False):
+    """Hold the window open so the report can actually be read.
+
+    Automatic when the console dies with us (double-clicked or UAC-elevated
+    launch). `--pause` forces it for the cases the heuristic cannot see -- a
+    terminal emulator that closes on exit, a shortcut, a Task Scheduler action
+    -- and `--no-pause` disables it outright for scripts and pipes.
+    """
+    if never:
+        return
+    if not force and not owns_console():
+        return
+    if not sys.stdin or not sys.stdin.isatty():
+        # No keyboard attached (input redirected, or launched with no stdin):
+        # waiting would hang forever instead of pausing.
         return
     try:
         input("\nPress Enter to close this window...")
@@ -773,8 +887,14 @@ def main():
                         help="How many below-threshold processes to show as context (default: 5)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress the banner and context table; print findings only")
+    parser.add_argument("--list-all", action="store_true",
+                        help="List every process that was inspected, with its score, "
+                             "not just the ones that crossed the threshold")
+    parser.add_argument("--pause", action="store_true",
+                        help="Always wait for Enter before exiting, so the window "
+                             "cannot close before the report has been read")
     parser.add_argument("--no-pause", action="store_true",
-                        help="Never wait for a keypress before exiting (frozen .exe only)")
+                        help="Never wait for Enter before exiting (for scripts and pipes)")
     args = parser.parse_args()
 
     elevated = is_elevated()
@@ -786,7 +906,10 @@ def main():
                 print("Scanning running processes ...\n")
 
             stats = {}
-            results = scan(min_score=args.min_score, deep=args.deep, stats=stats)
+            progress = None if args.quiet else _progress_writer()
+            results = scan(min_score=args.min_score, deep=args.deep, stats=stats,
+                           progress=progress)
+            _clear_progress(progress)
             exit_code = 1 if results else 0
 
             if args.quiet:
@@ -795,9 +918,17 @@ def main():
                 if results:
                     print()
                     print_report(results)
+                if args.list_all:
+                    print()
+                    print_process_table(stats, args.min_score)
             else:
                 print_scan_stats(stats, args.deep)
-                print_verdict(results, stats, args.min_score, args.top)
+                # The full listing goes before the verdict so the conclusion is
+                # the last thing left on screen after 300 rows have scrolled by.
+                if args.list_all:
+                    print_process_table(stats, args.min_score)
+                print_verdict(results, stats, args.min_score, args.top,
+                              show_context=not args.list_all)
 
             if args.json:
                 try:
@@ -827,7 +958,7 @@ def main():
         # Ctrl-C is how --watch is meant to end; don't dump a traceback for it.
         print("\nStopped.")
     finally:
-        pause_if_double_clicked(args.no_pause)
+        pause_before_exit(force=args.pause, never=args.no_pause)
 
     return exit_code
 

@@ -1,0 +1,8 @@
+argv0        : C:\Users\Asus\Desktop\project\keylogger-detector\_probe_dist\_probe.exe
+frozen       : True
+own pid      : 22568
+console count: 4
+console pids : _probe.exe(22568), _probe.exe(22912), bash.exe(23404), bash.exe(22348)
+stdin isatty : True
+stdout isatty: False
+--------------------------------------------------
