@@ -210,3 +210,142 @@ def test_get_self_identity_unfrozen_has_no_exe_match():
     own_pid, own_exe = kd.get_self_identity()
     assert own_pid == os.getpid()
     assert own_exe is None
+
+
+# --------------------------------------------------------------------------
+# _short_reasons — the one-line signal summary in the context table
+# --------------------------------------------------------------------------
+
+def test_short_reasons_strips_points_prefix_and_detail():
+    reasons = [r"[+3] Executable runs from a volatile/temp directory (C:\Temp\x.exe)"]
+    assert kd._short_reasons(reasons) == "Executable runs from a volatile/temp directory"
+
+
+def test_short_reasons_caps_at_limit_and_counts_the_rest():
+    reasons = ["[+1] One (detail)", "[+2] Two (detail)", "[+3] Three", "[+1] Four"]
+    out = kd._short_reasons(reasons, limit=2)
+    assert out == "One; Two; +2 more"
+
+
+def test_short_reasons_handles_no_signals():
+    assert kd._short_reasons([]) == "no signals"
+
+
+# --------------------------------------------------------------------------
+# scan() statistics — what makes a clean run visibly a completed scan
+# --------------------------------------------------------------------------
+
+class _ScanProc:
+    """Minimal stand-in for psutil.Process as scan() uses it."""
+
+    def __init__(self, pid, name, exe, threads=40, rss_mb=200):
+        self.pid = pid
+        self.info = {"pid": pid, "name": name, "exe": exe,
+                     "username": "tester", "create_time": 0}
+        self._threads = threads
+        self._rss = int(rss_mb * 1024 * 1024)
+
+    def open_files(self):
+        return []
+
+    def net_connections(self, kind="inet"):
+        return []
+
+    def num_threads(self):
+        return self._threads
+
+    def memory_info(self):
+        return namedtuple("_Mem", ["rss"])(self._rss)
+
+
+# An absolute path that really exists and is not in a temp directory, so the
+# only signal these fakes trip is the one each test is about. Using a made-up
+# path instead would silently add +3 for "executable no longer on disk".
+_REAL_EXE = os.path.abspath(__file__)
+
+
+def test_scan_populates_stats_and_separates_near_misses(monkeypatch):
+    """A clean scan must still report counts, timing and near-miss context;
+    that is what turns an empty-looking screen into evidence of work."""
+    procs = [
+        _ScanProc(101, "winkeylog.exe", _REAL_EXE),   # +4 explicit name -> flagged
+        _ScanProc(102, "nethook.exe", _REAL_EXE),     # +2 generic name  -> near miss
+        _ScanProc(103, "explorer.exe", _REAL_EXE),    # 0 signals
+        _ScanProc(104, "protected.exe", None),        # unreadable image path
+    ]
+    monkeypatch.setattr(kd.psutil, "process_iter", lambda attrs=None: iter(procs))
+    monkeypatch.setattr(kd, "get_visible_window_pids", lambda: set())
+    monkeypatch.setattr(kd, "IS_WINDOWS", False)   # disable the headless signal
+
+    stats = {}
+    results = kd.scan(min_score=4, deep=False, stats=stats)
+
+    assert [r["pid"] for r in results] == [101]
+    assert stats["total"] == 4
+    assert stats["flagged"] == 1
+    assert stats["restricted"] == 1                      # pid 104
+    assert stats["vanished"] == 0
+    assert stats["elapsed"] >= 0
+    # Near misses exclude the flagged process and are sorted worst-first.
+    assert 102 in [r["pid"] for r in stats["near_misses"]]
+    assert 101 not in [r["pid"] for r in stats["near_misses"]]
+    scores = [r["score"] for r in stats["near_misses"]]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_scan_counts_processes_that_vanish_mid_scan(monkeypatch):
+    """A process whose attribute dict cannot be read must be counted and
+    skipped -- never allowed to abort the scan and leave the user no report."""
+    class _VanishedProc:
+        pid = 201
+
+        @property
+        def info(self):
+            raise psutil.NoSuchProcess(201)
+
+    monkeypatch.setattr(kd.psutil, "process_iter", lambda attrs=None: iter([_VanishedProc()]))
+    monkeypatch.setattr(kd, "get_visible_window_pids", lambda: set())
+    monkeypatch.setattr(kd, "IS_WINDOWS", False)
+
+    stats = {}
+    results = kd.scan(min_score=4, deep=False, stats=stats)
+    assert results == []
+    assert stats["total"] == 1
+    assert stats["vanished"] == 1
+
+
+def test_scan_without_stats_still_works(monkeypatch):
+    """The stats argument is optional; omitting it must not break callers."""
+    monkeypatch.setattr(kd.psutil, "process_iter",
+                        lambda attrs=None: iter([_ScanProc(301, "calc.exe", _REAL_EXE)]))
+    monkeypatch.setattr(kd, "get_visible_window_pids", lambda: set())
+    monkeypatch.setattr(kd, "IS_WINDOWS", False)
+    assert kd.scan(min_score=4, deep=False) == []
+
+
+# --------------------------------------------------------------------------
+# Output is ASCII-only — a cp437/cp850 console must never crash mid-report
+# --------------------------------------------------------------------------
+
+def test_printed_output_is_ascii_only(capsys, monkeypatch):
+    """Every line the tool prints must survive a legacy Windows code page.
+    Non-ASCII here would raise UnicodeEncodeError on someone else's machine."""
+    monkeypatch.setattr(kd, "IS_WINDOWS", True)
+    kd.print_banner(4, False, False)
+    kd.print_banner(9, True, True)
+    kd.print_scan_stats({"total": 3, "restricted": 1, "vanished": 1,
+                         "elapsed": 1.5, "window_map": False}, False)
+
+    flagged = [{"pid": 1, "name": "winkeylog.exe", "exe": r"C:\Temp\winkeylog.exe",
+                "user": "me", "score": 13, "risk": "HIGH",
+                "reasons": [r"[+4] Process name matches keylogger pattern 'key\s*log'"]}]
+    near = {"near_misses": [{"pid": 2, "name": "nethook.exe", "score": 2,
+                             "reasons": ["[+2] Generic name (detail)"]}]}
+    kd.print_verdict(flagged, near, 4, 5)
+    kd.print_verdict([], near, 4, 5)
+    kd.print_verdict([], {"near_misses": []}, 4, 5)
+
+    out = capsys.readouterr().out
+    assert out.strip()
+    out.encode("cp437")        # raises UnicodeEncodeError if any char is non-ASCII
+    assert all(ord(ch) < 128 for ch in out)

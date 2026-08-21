@@ -20,6 +20,12 @@ Usage:
     python keylogger_detector.py --min-score 2     # widen the net
     python keylogger_detector.py --watch 30        # rescan every 30s
     python keylogger_detector.py --json out.json   # dump full report
+    python keylogger_detector.py --top 10          # show more near-miss context
+    python keylogger_detector.py --quiet           # findings only, no banner
+
+Every run prints what it inspected (process count, timing, privilege level)
+and the highest scores it saw, so a clean result is visibly a completed scan
+rather than an empty screen.
 """
 
 import argparse
@@ -36,11 +42,37 @@ try:
 except ImportError:
     sys.exit("psutil is required: pip install psutil")
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 IS_MAC = platform.system() == "Darwin"
+IS_FROZEN = getattr(sys, "frozen", False)
+
+
+def configure_stdout():
+    """Make stdout tolerate any console code page.
+
+    The released .exe runs on machines we do not control: a fresh Windows
+    console is typically code page 437/850/932, and Python then encodes stdout
+    as cp1252/cp932. Printing a character the code page lacks raises
+    UnicodeEncodeError mid-report -- i.e. the tool would crash on someone
+    else's computer while printing its own findings. Process names and file
+    paths come from the OS and may contain anything at all.
+
+    So: ask for UTF-8, and fall back to replacing unencodable characters. The
+    tool's own output is deliberately plain ASCII (see ASCII-only banner /
+    table drawing below); this protects the parts that echo OS-supplied text.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # Python < 3.7, or a stream that is not reconfigurable (piped,
+            # redirected to a file, or absent under a GUI host). Printing
+            # still works; only exotic characters degrade.
+            pass
+
 
 # ---------------------------------------------------------------------------
 # Heuristic signal definitions
@@ -109,6 +141,59 @@ def is_volatile_path(path):
 
 def _is_loopback(ip):
     return ip.startswith("127.") or ip == "::1" or ip == "0.0.0.0"
+
+
+# ---------------------------------------------------------------------------
+# Runtime environment (privilege level, console ownership)
+# ---------------------------------------------------------------------------
+
+def is_elevated():
+    """Return True if we have admin/root rights, False if not, None if unknown.
+
+    This is reported in the banner because privilege directly determines how
+    much of the system is visible: without it, other users' processes deny
+    open_files()/net_connections() and HKLM Run keys may be unreadable, so a
+    "clean" verdict covers less ground. Being explicit about that beats
+    silently under-reporting.
+    """
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return None
+    if hasattr(os, "geteuid"):
+        return os.geteuid() == 0
+    return None
+
+
+def owns_console():
+    """True if this process is the only one attached to its console window.
+
+    That is the signature of a double-clicked .exe (and of an elevated one,
+    which Windows always gives a brand-new console): when the program returns,
+    the console is destroyed with it, so any output vanishes before it can be
+    read. Launched from an existing cmd/PowerShell/bash session, the shell is
+    attached too and the window survives.
+
+    Returns False on non-Windows and whenever the answer cannot be determined,
+    so we never block a scripted run waiting for a keypress.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetConsoleProcessList.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+        kernel32.GetConsoleProcessList.restype = wintypes.DWORD
+
+        buf = (wintypes.DWORD * 8)()
+        count = kernel32.GetConsoleProcessList(buf, 8)
+        return count == 1
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +527,18 @@ def _score_process(proc, have_window_map, visible_pids, deep):
         return None
 
 
-def scan(min_score=4, deep=False):
+def scan(min_score=4, deep=False, stats=None):
+    """Score every visible process and return those at or above `min_score`.
+
+    If `stats` is a dict it is filled in with what the scan actually did --
+    process counts, how many were only partially readable, elapsed time, and
+    the highest-scoring processes that stayed *below* the threshold. main()
+    prints those so that a clean run still shows evidence of work instead of
+    a bare "nothing found". Passing stats is optional, which keeps the older
+    two-argument call signature working.
+    """
+    started = time.perf_counter()
+
     visible_pids = get_visible_window_pids()
     # None => enumeration failed; don't trust the headless signal at all.
     have_window_map = IS_WINDOWS and visible_pids is not None
@@ -451,15 +547,49 @@ def scan(min_score=4, deep=False):
 
     own_pid, own_exe = get_self_identity()
 
-    results = []
+    total = 0
+    vanished = 0
+    restricted = 0
+    scored = []
     for proc in psutil.process_iter(["pid", "name", "exe", "username", "create_time"]):
-        if is_self(proc.info, own_pid, own_exe):
+        # Read the cached attribute dict defensively: one process raising here
+        # must never abort the whole scan and leave the user with no report.
+        try:
+            info = proc.info
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            total += 1
+            vanished += 1
             continue
+        if is_self(info, own_pid, own_exe):
+            continue
+        total += 1
         r = _score_process(proc, have_window_map, visible_pids, deep)
-        if r and r["score"] >= min_score:
-            results.append(r)
+        if r is None:
+            # Exited between enumeration and inspection, or wholly unreadable.
+            vanished += 1
+            continue
+        if not r["exe"]:
+            # psutil blanks attributes it cannot read rather than raising, so a
+            # missing image path is the observable marker of a process we could
+            # only partially inspect (protected, or owned by another user).
+            restricted += 1
+        scored.append(r)
 
-    results.sort(key=lambda r: r["score"], reverse=True)
+    scored.sort(key=lambda r: r["score"], reverse=True)
+    results = [r for r in scored if r["score"] >= min_score]
+
+    if stats is not None:
+        stats.update({
+            "total": total,
+            "scored": len(scored),
+            "vanished": vanished,
+            "restricted": restricted,
+            "flagged": len(results),
+            "elapsed": time.perf_counter() - started,
+            "window_map": have_window_map,
+            "near_misses": [r for r in scored if r["score"] < min_score],
+        })
+
     return results
 
 
@@ -471,28 +601,163 @@ def classify(score):
     return "LOW"
 
 
-def print_report(results):
-    if not results:
-        print("No processes crossed the score threshold. System looks clean by these heuristics.")
-        return
+RULE = "=" * 74
+THIN = "-" * 74
 
-    print(f"\n{'PID':<8}{'RISK':<8}{'SCORE':<7}{'PROCESS':<28}USER")
-    print("-" * 74)
+
+def _short_reasons(reasons, limit=2):
+    """Condense scoring reasons into one short line for the context table.
+
+    "[+1] Runs without a visible window (headless/background)" -> "Runs
+    without a visible window". The parenthetical detail is dropped because the
+    full text is already available in --json and in the flagged-process
+    details block.
+    """
+    out = []
+    for reason in reasons[:limit]:
+        text = re.sub(r"^\[\+\d+\]\s*", "", reason)
+        out.append(text.split(" (")[0])
+    extra = len(reasons) - len(out)
+    if extra > 0:
+        out.append(f"+{extra} more")
+    return "; ".join(out) if out else "no signals"
+
+
+def print_banner(min_score, deep, elevated):
+    """Print what this run is about to do, before any scanning happens.
+
+    Deliberately ASCII-only: this is the first thing a downloaded .exe prints
+    on an unknown machine, and box-drawing characters raise
+    UnicodeEncodeError on a cp437/cp850 console.
+    """
+    print(RULE)
+    print(f"  Keylogger Detector {__version__}  -  heuristic process scan")
+    print(RULE)
+    print(f"  Host        : {platform.node()} ({platform.system()} {platform.release()})")
+    print(f"  Started     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if deep:
+        print("  Mode        : DEEP (inspects open file handles; slower)")
+    else:
+        print("  Mode        : QUICK (add --deep to inspect open file handles)")
+
+    if elevated is True:
+        print(f"  Privileges  : {'administrator' if IS_WINDOWS else 'root'} - full visibility")
+    elif elevated is False:
+        label = "standard user" if IS_WINDOWS else "non-root"
+        hint = "run as administrator" if IS_WINDOWS else "re-run with sudo"
+        print(f"  Privileges  : {label} - limited visibility ({hint} to inspect all processes)")
+    else:
+        print("  Privileges  : unknown")
+
+    print(f"  Threshold   : report score >= {min_score}   (LOW 4-5 / MEDIUM 6-8 / HIGH 9+)")
+    print(THIN)
+
+
+def print_scan_stats(stats, deep):
+    """Print evidence that the scan ran: counts, timing, coverage caveats."""
+    print(f"  Inspected {stats['total']} running processes in {stats['elapsed']:.1f}s")
+    if stats["restricted"]:
+        print(f"  {stats['restricted']} could only be read partially "
+              "(protected or owned by another user)")
+    if stats["vanished"]:
+        print(f"  {stats['vanished']} exited while the scan was in progress")
+    if IS_WINDOWS and not stats["window_map"]:
+        print("  [!] Could not enumerate windows - the headless signal was skipped")
+    if IS_WINDOWS and not deep:
+        print("  Note: open file handles were NOT inspected in quick mode "
+              "(use --deep for that signal)")
+    print()
+
+
+def print_report(results):
+    """Print the flagged processes: summary table, then per-process evidence."""
+    print(f"{'PID':<8}{'RISK':<8}{'SCORE':<7}{'PROCESS':<28}USER")
+    print(THIN)
     for r in results:
-        name = (r["name"] or "")[:27]
+        name = (r["name"] or "?")[:27]
         print(f"{r['pid']:<8}{r['risk']:<8}{r['score']:<7}{name:<28}{r['user'] or ''}")
 
-    print("\nDetails:\n")
+    print("\nWhy each was flagged:\n")
     for r in results:
-        print(f"PID {r['pid']} — {r['name']} [{r['risk']}, score {r['score']}]")
-        print(f"  exe: {r['exe']}")
+        print(f"  PID {r['pid']} - {r['name']} [{r['risk']}, score {r['score']}]")
+        print(f"    exe: {r['exe'] or '(unreadable)'}")
         for reason in r["reasons"]:
-            print(f"  {reason}")
+            print(f"    {reason}")
         print()
 
 
+def print_near_misses(stats, min_score, top):
+    """Show the highest scores that stayed below the threshold.
+
+    This is the antidote to a blank screen on a clean machine: it proves the
+    scan examined real processes and shows how far the closest one was from
+    being reported. Explicitly labelled as not-an-alert, because an analyst
+    reading a list of process names will otherwise assume they are findings.
+    """
+    candidates = [r for r in stats.get("near_misses", []) if r["score"] > 0]
+    if not candidates:
+        print(f"  Not one process scored above 0, so nothing came close to the "
+              f"threshold of {min_score}.")
+        return
+
+    shown = candidates[:top]
+    print(f"  Highest scores seen, all BELOW the threshold of {min_score} "
+          "- context, NOT alerts:\n")
+    print(f"    {'SCORE':<7}{'PID':<8}{'PROCESS':<26}SIGNALS")
+    print("    " + "-" * 66)
+    for r in shown:
+        name = (r["name"] or "?")[:25]
+        print(f"    {r['score']:<7}{r['pid']:<8}{name:<26}{_short_reasons(r['reasons'])}")
+    remaining = len(candidates) - len(shown)
+    if remaining:
+        print(f"    ... and {remaining} more scoring 1-{min_score - 1} "
+              f"(--top {len(candidates)} to list them all)")
+
+
+def print_verdict(results, stats, min_score, top):
+    """Print the headline conclusion, then either findings or near-miss context."""
+    if not results:
+        print(f"RESULT: CLEAN - no process reached a score of {min_score}.")
+        print("        Nothing on this system looks like a keylogger by these heuristics.\n")
+        print_near_misses(stats, min_score, top)
+        print("\n  Reminder: these are behavioural heuristics, not proof of absence."
+              "\n  A kernel-mode or in-memory-only logger can evade every check here.")
+        return
+
+    bands = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for r in results:
+        bands[r["risk"]] = bands.get(r["risk"], 0) + 1
+    headline = ", ".join(f"{bands[b]} {b}" for b in ("HIGH", "MEDIUM", "LOW") if bands[b])
+
+    print(f"RESULT: {len(results)} process(es) flagged ({headline}) "
+          f"at score >= {min_score}.")
+    print("        Treat these as leads to triage, not verdicts.\n")
+    print_report(results)
+
+
+def pause_if_double_clicked(no_pause):
+    """Hold the window open when we are the only process on the console.
+
+    A double-clicked (or UAC-elevated) .exe gets a console of its own that
+    Windows destroys the instant the program returns -- the report would flash
+    past unread, which looks exactly like "the terminal is always empty".
+    Launched from an existing shell, owns_console() is False and we return
+    immediately so piping and scripting are unaffected.
+    """
+    if no_pause or not IS_FROZEN or not owns_console():
+        return
+    try:
+        input("\nPress Enter to close this window...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Heuristic keylogger / input-hook detector")
+    parser = argparse.ArgumentParser(
+        prog="keylogger-detector",
+        description="Heuristic keylogger / input-hook detector",
+        epilog="Exit code: 0 = nothing flagged, 1 = at least one process flagged.")
     parser.add_argument("--version", action="version",
                         version=f"keylogger-detector {__version__}")
     parser.add_argument("--min-score", type=int, default=4,
@@ -504,34 +769,69 @@ def main():
                              "(Windows: slower, ~20s; always on elsewhere)")
     parser.add_argument("--json", type=str, default=None,
                         help="Write the full report to this path as JSON")
+    parser.add_argument("--top", type=int, default=5, metavar="N",
+                        help="How many below-threshold processes to show as context (default: 5)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress the banner and context table; print findings only")
+    parser.add_argument("--no-pause", action="store_true",
+                        help="Never wait for a keypress before exiting (frozen .exe only)")
     args = parser.parse_args()
 
-    if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() != 0:
-        print("[!] Not running as root — /proc/*/fd access and some checks will be limited.\n")
-    if IS_WINDOWS and not args.deep:
-        print("[i] Quick scan. Add --deep to inspect open file handles for temp keystroke logs (slower).\n")
+    elevated = is_elevated()
+    exit_code = 0
+    try:
+        while True:
+            if not args.quiet:
+                print_banner(args.min_score, args.deep, elevated)
+                print("Scanning running processes ...\n")
 
-    while True:
-        results = scan(min_score=args.min_score, deep=args.deep)
-        print(f"Scan @ {datetime.now().isoformat(timespec='seconds')} — "
-              f"{len(results)} flagged process(es) (platform: {platform.system()}, min-score {args.min_score})")
-        print_report(results)
+            stats = {}
+            results = scan(min_score=args.min_score, deep=args.deep, stats=stats)
+            exit_code = 1 if results else 0
 
-        if args.json:
+            if args.quiet:
+                print(f"Scan @ {datetime.now().isoformat(timespec='seconds')} - "
+                      f"{len(results)} flagged (min-score {args.min_score})")
+                if results:
+                    print()
+                    print_report(results)
+            else:
+                print_scan_stats(stats, args.deep)
+                print_verdict(results, stats, args.min_score, args.top)
+
+            if args.json:
+                try:
+                    parent = os.path.dirname(os.path.abspath(args.json))
+                    os.makedirs(parent, exist_ok=True)
+                    with open(args.json, "w", encoding="utf-8") as f:
+                        json.dump(results, f, indent=2)
+                    print(f"\nFull report written to {args.json}")
+                except OSError as exc:
+                    # A released binary should not greet the user with a traceback.
+                    print(f"\n[!] Could not write report to {args.json}: {exc}")
+
+            if args.watch <= 0:
+                break
+            print(f"\n{THIN}\nRescanning in {args.watch}s -- press Ctrl-C to stop.\n")
+            # Flush before sleeping. Redirected to a file or pipe, Python
+            # block-buffers stdout, so a --watch run that is later killed
+            # (Ctrl-C, SIGTERM, machine shutdown) would otherwise discard the
+            # findings it had already printed -- the worst possible moment to
+            # lose a monitoring log.
             try:
-                parent = os.path.dirname(os.path.abspath(args.json))
-                os.makedirs(parent, exist_ok=True)
-                with open(args.json, "w") as f:
-                    json.dump(results, f, indent=2)
-                print(f"Full report written to {args.json}")
-            except OSError as exc:
-                # A released binary should not greet the user with a traceback.
-                print(f"[!] Could not write report to {args.json}: {exc}")
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        # Ctrl-C is how --watch is meant to end; don't dump a traceback for it.
+        print("\nStopped.")
+    finally:
+        pause_if_double_clicked(args.no_pause)
 
-        if args.watch <= 0:
-            break
-        time.sleep(args.watch)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    configure_stdout()
+    sys.exit(main())
