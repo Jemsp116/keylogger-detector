@@ -1,0 +1,14 @@
+# Development / build dependencies.
+# Runtime dependencies live in requirements.txt (psutil only) so that the
+# published tool stays a one-dependency install.
+#
+#   pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# Freezes keylogger_detector.py into a standalone Windows .exe (see build.py).
+pyinstaller>=6.3,<7
+
+# Test + lint toolchain (also what .github/workflows/lint.yml installs).
+pytest>=7.0
+flake8>=6.0

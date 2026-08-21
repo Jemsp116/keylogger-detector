@@ -6,6 +6,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)
 ![Status](https://img.shields.io/badge/status-active-brightgreen)
+[![Download](https://img.shields.io/badge/download-Windows%20.exe-0078d4)](https://github.com/Jemsp116/keylogger-detector/releases/latest)
 
 It is **read-only**: it never hooks the keyboard, injects into processes, or reads another process's memory. It only inspects metadata the OS already exposes — `psutil`, a single `EnumWindows` pass on Windows, `/proc` on Linux — and scores it.
 
@@ -15,6 +16,7 @@ It is **read-only**: it never hooks the keyboard, injects into processes, or rea
 
 - [Why heuristic, not signature-based](#why-heuristic-not-signature-based)
 - [How it works](#how-it-works)
+- [Download & run (Windows .exe)](#download--run-windows-exe)
 - [Install](#install)
 - [Usage](#usage)
 - [Sample output](#sample-output)
@@ -54,7 +56,39 @@ Scores roll up into risk bands — **LOW 4–5 · MEDIUM 6–8 · HIGH 9+** — 
 
 > **Corroboration in practice:** on the development machine, a naive single-signal version of this scorer flagged **133 of ~300 processes** (VS Code alone scored 79 — each of its ~25 open `.log` handles added +3). The corroboration model flags **2**, both explainable.
 
+The detector also never reports **itself** — the released binary is called `keylogger-detector.exe`, which matches its own `keylog` name pattern. That exclusion keys off process *identity* (our PID, plus our executable path in the frozen build), never off the name, so a hostile binary can't hide by calling itself `keylogger-detector.exe`.
+
+## Download & run (Windows .exe)
+
+No Python needed — grab the latest `keylogger-detector.exe` from the [Releases page](https://github.com/Jemsp116/keylogger-detector/releases/latest).
+
+**SmartScreen warning.** Windows will show "Windows protected your PC" the first time you run it — expected for an unsigned indie binary (a code-signing certificate costs a few hundred dollars a year, which this project doesn't have). To proceed: click **More info → Run anyway**. Two honest alternatives if you'd rather not: verify the SHA-256 published with each release, or skip the binary and [run from source](#install).
+
+```bash
+certutil -hashfile keylogger-detector.exe SHA256
+```
+
+Your antivirus may also flag it. A single-file executable that enumerates every process on the machine looks, to a scanner, a lot like the thing it's built to catch — the irony is unavoidable. The source is right here in this repo if you want to read it before trusting it.
+
+**Admin rights / UAC prompt.** The exe embeds a `requireAdministrator` manifest, so Windows shows its normal elevation consent prompt at launch. That is deliberate, and nothing is auto-elevated behind your back — decline the prompt and the program simply doesn't start. Elevation is what lets the detector:
+
+- inspect **open file handles** of processes owned by other users (`--deep`) — the signal that finds keystroke logs in `%TEMP%`
+- read the **`HKLM\...\Run`** persistence key and resolve executable paths for protected processes
+
+Run it unelevated and it still works, but those checks quietly return less.
+
+**Quick start:**
+
+```
+keylogger-detector.exe                  # quick scan (score >= 4)
+keylogger-detector.exe --deep           # also inspect open handles (slower)
+keylogger-detector.exe --json out.json  # write the full report as JSON
+keylogger-detector.exe --version
+```
+
 ## Install
+
+Prefer running from source, or on Linux/macOS:
 
 ```bash
 pip install -r requirements.txt
@@ -139,12 +173,26 @@ Treat every result as a triage lead, not a verdict.
 ## Development
 
 ```bash
-pip install psutil pytest flake8
-python -m pytest tests/ -q         # unit tests over the scoring functions
-flake8 keylogger_detector.py tests/
+pip install -r requirements-dev.txt
+python -m pytest tests/ -q                    # unit tests over the scoring functions
+flake8 keylogger_detector.py build.py tests/
 ```
 
 Tests exercise the pure heuristics against synthetic process metadata, so they're fast, deterministic, and don't depend on what happens to be running. CI runs lint + tests on every push (`.github/workflows/lint.yml`).
+
+### Building the Windows .exe
+
+```bash
+python build.py                # release build -> dist/keylogger-detector.exe
+python build.py --no-uac       # local test build, no elevation prompt
+python build.py --resources-only
+```
+
+`build.py` drives PyInstaller with `--onefile --console`, embeds a Windows version resource (product name, `1.0.0`, description) generated from `__version__`, and embeds the `requireAdministrator` manifest. It prints the exe's size and SHA-256 when it finishes.
+
+To brand the binary, drop a 256×256 multi-resolution icon at **`assets/icon.ico`** — `build.py` picks it up automatically, and builds fine without one.
+
+> The `--no-uac` build exists because an elevated exe opens its own console window, so a normal shell can't capture its stdout. Use it for local output testing; never ship it.
 
 Contributions welcome — open an issue for new heuristic ideas or platform coverage before sending a PR.
 

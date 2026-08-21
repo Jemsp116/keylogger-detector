@@ -17,3 +17,13 @@ venv/
 
 # Local tool settings
 .claude/settings.local.json
+
+# PyInstaller build artifacts (see build.py). The exe is published as a
+# GitHub Release asset, never committed to the repo.
+build/
+dist/
+build_resources/
+*.spec
+*.manifest
+version_info.txt
+*.sha256

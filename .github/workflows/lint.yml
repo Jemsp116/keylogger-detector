@@ -13,6 +13,6 @@ jobs:
       - name: Install dependencies
         run: pip install psutil pytest flake8
       - name: Lint
-        run: flake8 keylogger_detector.py tests/
+        run: flake8 keylogger_detector.py build.py tests/
       - name: Test
         run: python -m pytest tests/ -q

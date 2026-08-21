@@ -10,6 +10,8 @@ any platform / in CI.
 
 from collections import namedtuple
 
+import os
+
 import psutil
 
 import keylogger_detector as kd
@@ -168,3 +170,43 @@ def test_realistic_keylogger_scores_high():
     conns = [_Conn(psutil.CONN_ESTABLISHED, _Addr("203.0.113.9", 443))]
     score = kd.check_headless_and_network(_NetProc(conns), True, reasons, score)  # +3
     assert kd.classify(score) == "HIGH"
+
+
+# --------------------------------------------------------------------------
+# self-exclusion — the detector must not report itself
+# --------------------------------------------------------------------------
+
+def test_is_self_matches_own_pid():
+    assert kd.is_self({"pid": os.getpid()}, os.getpid(), None) is True
+
+
+def test_is_self_ignores_unrelated_pid():
+    other = os.getpid() + 12345
+    assert kd.is_self({"pid": other, "exe": "C:\\Windows\\explorer.exe"},
+                      os.getpid(), None) is False
+
+
+def test_is_self_matches_frozen_bootloader_by_exe_path():
+    """A --onefile build runs as bootloader + child sharing one exe path;
+    both halves are 'us' and neither should be reported."""
+    own_exe = os.path.normcase(os.path.realpath(__file__))
+    assert kd.is_self({"pid": os.getpid() + 999, "exe": __file__},
+                      os.getpid(), own_exe) is True
+
+
+def test_is_self_is_identity_based_not_name_based():
+    """A hostile binary merely *named* like us must stay detectable — the
+    exclusion keys off our real executable path, never off the process name."""
+    own_exe = os.path.normcase(os.path.realpath(__file__))
+    impostor = {"pid": os.getpid() + 999,
+                "name": "keylogger-detector.exe",
+                "exe": os.path.join(os.path.dirname(__file__), "keylogger-detector.exe")}
+    assert kd.is_self(impostor, os.getpid(), own_exe) is False
+
+
+def test_get_self_identity_unfrozen_has_no_exe_match():
+    """Running as a .py, only our own PID is excluded — so other Python
+    processes (e.g. a keylogger written in Python) stay fully scannable."""
+    own_pid, own_exe = kd.get_self_identity()
+    assert own_pid == os.getpid()
+    assert own_exe is None

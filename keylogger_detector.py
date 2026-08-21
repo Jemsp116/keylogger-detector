@@ -36,6 +36,8 @@ try:
 except ImportError:
     sys.exit("psutil is required: pip install psutil")
 
+__version__ = "1.0.0"
+
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 IS_MAC = platform.system() == "Darwin"
@@ -357,6 +359,53 @@ def check_resource_footprint(proc, reasons, score):
 
 
 # ---------------------------------------------------------------------------
+# Self-exclusion
+# ---------------------------------------------------------------------------
+
+def get_self_identity():
+    """Return ``(own_pid, own_exe)`` used to keep the detector out of its own report.
+
+    This is deliberately **identity-based, never name-based**: we suppress *this
+    running program*, not anything that happens to be called
+    "keylogger-detector". A malicious binary cannot dodge detection by renaming
+    itself to match us.
+
+    Why it is needed: the released binary is ``keylogger-detector.exe``, whose
+    name matches our own EXPLICIT_KEYLOGGER_PATTERNS (``key\\s*log``, +4), so
+    without this the scanner would flag itself every run.
+
+    ``own_exe`` is only populated when frozen by PyInstaller, because a
+    ``--onefile`` build runs as two processes (bootloader parent + app child)
+    that share one executable path. Unfrozen, we return None so that other
+    Python processes stay fully scannable — a keylogger written in Python must
+    remain detectable.
+    """
+    own_pid = os.getpid()
+    own_exe = None
+    if getattr(sys, "frozen", False):
+        try:
+            own_exe = os.path.normcase(os.path.realpath(sys.executable))
+        except Exception:
+            own_exe = None
+    return own_pid, own_exe
+
+
+def is_self(proc_info, own_pid, own_exe):
+    """True if `proc_info` describes this detector process (or its bootloader)."""
+    if proc_info.get("pid") == own_pid:
+        return True
+    if own_exe:
+        exe = proc_info.get("exe")
+        if exe:
+            try:
+                if os.path.normcase(os.path.realpath(exe)) == own_exe:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Main scan
 # ---------------------------------------------------------------------------
 
@@ -400,8 +449,12 @@ def scan(min_score=4, deep=False):
     if visible_pids is None:
         visible_pids = set()
 
+    own_pid, own_exe = get_self_identity()
+
     results = []
     for proc in psutil.process_iter(["pid", "name", "exe", "username", "create_time"]):
+        if is_self(proc.info, own_pid, own_exe):
+            continue
         r = _score_process(proc, have_window_map, visible_pids, deep)
         if r and r["score"] >= min_score:
             results.append(r)
@@ -440,6 +493,8 @@ def print_report(results):
 
 def main():
     parser = argparse.ArgumentParser(description="Heuristic keylogger / input-hook detector")
+    parser.add_argument("--version", action="version",
+                        version=f"keylogger-detector {__version__}")
     parser.add_argument("--min-score", type=int, default=4,
                         help="Only report processes scoring at or above this threshold (default: 4)")
     parser.add_argument("--watch", type=int, default=0,
@@ -463,9 +518,15 @@ def main():
         print_report(results)
 
         if args.json:
-            with open(args.json, "w") as f:
-                json.dump(results, f, indent=2)
-            print(f"Full report written to {args.json}")
+            try:
+                parent = os.path.dirname(os.path.abspath(args.json))
+                os.makedirs(parent, exist_ok=True)
+                with open(args.json, "w") as f:
+                    json.dump(results, f, indent=2)
+                print(f"Full report written to {args.json}")
+            except OSError as exc:
+                # A released binary should not greet the user with a traceback.
+                print(f"[!] Could not write report to {args.json}: {exc}")
 
         if args.watch <= 0:
             break
